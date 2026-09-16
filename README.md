@@ -8,6 +8,13 @@
 - 如需自动探测，可改为 `default_route=auto`；未知目标会先尝试直连，失败后改走外网代理，并缓存成功路线。
 - `host_overrides` 可为内网域名指定 IP，避免集群或 PC 的 DNS 差异。
 
+## 获取代码
+
+```powershell
+git clone https://github.com/chengengjian/smart-proxy-gateway.git
+Set-Location smart-proxy-gateway
+```
+
 ## Windows 启动
 
 复制示例配置并修改上游代理、集群节点白名单和密码：

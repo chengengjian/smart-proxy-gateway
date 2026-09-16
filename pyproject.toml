@@ -30,6 +30,10 @@ test = ["pytest>=8"]
 [project.scripts]
 smart-proxy-gateway = "smart_proxy_gateway:main"
 
+[project.urls]
+Repository = "https://github.com/chengengjian/smart-proxy-gateway"
+Issues = "https://github.com/chengengjian/smart-proxy-gateway/issues"
+
 [tool.setuptools]
 py-modules = ["smart_proxy_gateway"]
 
