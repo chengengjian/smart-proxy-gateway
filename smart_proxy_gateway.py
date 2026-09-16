@@ -12,11 +12,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import hmac
 import ipaddress
 import json
 import logging
-import os
 import signal
 import time
 from dataclasses import dataclass, field
@@ -77,41 +75,6 @@ def _parse_list(value: object, field_name: str) -> tuple[str, ...]:
 
 
 @dataclass(frozen=True)
-class GatewayAuth:
-    username: str
-    password: str
-
-    @classmethod
-    def from_mapping(cls, raw: object) -> GatewayAuth | None:
-        if raw is None:
-            return None
-        if not isinstance(raw, Mapping):
-            raise ConfigError("auth must be an object")
-        username = str(raw.get("username", "")).strip()
-        password = str(raw.get("password", ""))
-        password_env = str(raw.get("password_env", "")).strip()
-        if password and password_env:
-            raise ConfigError("auth may use password or password_env, not both")
-        if password_env:
-            password = os.environ.get(password_env, "")
-            if not password:
-                raise ConfigError(f"environment variable {password_env!r} is empty")
-        if not username or not password:
-            raise ConfigError("auth requires a username and password")
-        return cls(username=username, password=password)
-
-    def accepts(self, header: str | None) -> bool:
-        if header is None or not header.lower().startswith("basic "):
-            return False
-        try:
-            decoded = base64.b64decode(header[6:].strip(), validate=True).decode("utf-8")
-        except (ValueError, UnicodeDecodeError):
-            return False
-        expected = f"{self.username}:{self.password}"
-        return hmac.compare_digest(decoded, expected)
-
-
-@dataclass(frozen=True)
 class ProxyConfig:
     listen_host: str
     listen_port: int
@@ -122,7 +85,6 @@ class ProxyConfig:
     direct_networks: tuple[ipaddress._BaseNetwork, ...]
     host_overrides: Mapping[str, str]
     allowed_clients: tuple[ipaddress._BaseNetwork, ...]
-    auth: GatewayAuth | None
     connect_timeout_seconds: float
     header_timeout_seconds: float
     decision_cache_seconds: float
@@ -133,6 +95,10 @@ class ProxyConfig:
             raw = json.load(handle)
         if not isinstance(raw, Mapping):
             raise ConfigError("configuration root must be an object")
+        if "auth" in raw:
+            raise ConfigError(
+                "auth is no longer supported; remove it and restrict allowed_clients"
+            )
 
         listen_host, listen_port = _split_host_port(str(raw.get("listen", "127.0.0.1:18081")), 18081)
         upstream = urlsplit(str(raw.get("upstream_proxy", "")))
@@ -198,7 +164,6 @@ class ProxyConfig:
             direct_networks=direct_networks,
             host_overrides=overrides,
             allowed_clients=allowed_clients,
-            auth=GatewayAuth.from_mapping(raw.get("auth")),
             connect_timeout_seconds=positive_float("connect_timeout_seconds", 1.0),
             header_timeout_seconds=positive_float("header_timeout_seconds", 10.0),
             decision_cache_seconds=positive_float("decision_cache_seconds", 600.0),
@@ -394,11 +359,6 @@ class SmartProxyGateway:
             if len(raw) > MAX_HEADER_BYTES:
                 raise ProxyProtocolError("request headers are too large")
             request = parse_request_head(raw)
-            if self.config.auth is not None and not self.config.auth.accepts(
-                request.header("Proxy-Authorization")
-            ):
-                await self._send_proxy_auth_required(writer)
-                return
             if request.method == "GET" and urlsplit(request.target).path == "/healthz":
                 await self._send_health(writer)
                 return
@@ -513,17 +473,6 @@ class SmartProxyGateway:
             f"HTTP/1.1 {status} Proxy Error\r\nContent-Type: text/plain; charset=utf-8\r\n"
             f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
             + body
-        )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
-
-    @staticmethod
-    async def _send_proxy_auth_required(writer: asyncio.StreamWriter) -> None:
-        writer.write(
-            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-            b'Proxy-Authenticate: Basic realm="smart-proxy"\r\n'
-            b"Content-Length: 0\r\nConnection: close\r\n\r\n"
         )
         await writer.drain()
         writer.close()

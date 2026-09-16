@@ -17,11 +17,10 @@ Set-Location smart-proxy-gateway
 
 ## Windows 启动
 
-复制示例配置并修改上游代理、集群节点白名单和密码：
+复制示例配置并修改上游代理和集群节点白名单：
 
 ```powershell
 Copy-Item config.example.json .\smart-proxy.json
-$env:SMART_PROXY_PASSWORD = '<生成一个长随机密码>'
 python smart_proxy_gateway.py --config .\smart-proxy.json
 ```
 
@@ -30,13 +29,13 @@ python smart_proxy_gateway.py --config .\smart-proxy.json
 健康检查：
 
 ```powershell
-curl.exe -x http://ouroboros:$env:SMART_PROXY_PASSWORD@127.0.0.1:18081 http://proxy.local/healthz
+curl.exe -x http://127.0.0.1:18081 http://proxy.local/healthz
 ```
 
 华为登录接口直连测试：
 
 ```powershell
-curl.exe -vk -x http://ouroboros:$env:SMART_PROXY_PASSWORD@127.0.0.1:18081 `
+curl.exe -vk -x http://127.0.0.1:18081 `
   https://rnd-idea-api.huawei.com/ideaclientservice/login/v4/secureLogin
 ```
 
@@ -47,7 +46,7 @@ curl.exe -vk -x http://ouroboros:$env:SMART_PROXY_PASSWORD@127.0.0.1:18081 `
 在平台代理配置中，将 HTTP/HTTPS 代理改成 PC 网关地址：
 
 ```text
-http://ouroboros:<密码>@<PC可被集群访问的IP>:18081
+http://<PC可被集群访问的IP>:18081
 ```
 
 DSH Pod 仍只连接自己的 `auth-proxy` sidecar；sidecar 再连接 PC 智能网关。PC 网关负责最后一层内外网分流。
@@ -61,7 +60,7 @@ DSH Pod 仍只连接自己的 `auth-proxy` sidecar；sidecar 再连接 PC 智能
 ## 安全边界
 
 - 网关只做 TCP 隧道和普通 HTTP 转发，不执行 HTTPS MITM。
-- 必须配置 `allowed_clients`。
-- 推荐使用 `auth.password_env`，不要把密码写进配置或提交到 Git。
+- 必须配置 `allowed_clients`，且只加入实际需要使用网关的主机或网段。
+- 网关不提供用户名密码认证；来源 IP 白名单和 Windows 防火墙是访问控制边界。
 - Windows 防火墙应进一步限制来源 IP。
 - 上游代理 URL 可以带认证，例如 `http://user:password@127.0.0.1:7890`。

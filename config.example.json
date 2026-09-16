@@ -22,10 +22,6 @@
     "127.0.0.1/32",
     "7.242.106.192/32"
   ],
-  "auth": {
-    "username": "ouroboros",
-    "password_env": "SMART_PROXY_PASSWORD"
-  },
   "connect_timeout_seconds": 1.0,
   "header_timeout_seconds": 10.0,
   "decision_cache_seconds": 600

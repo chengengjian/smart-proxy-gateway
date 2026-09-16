@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,6 @@ import pytest
 from smart_proxy_gateway import (
     ConfigError,
     DecisionCache,
-    GatewayAuth,
     ProxyConfig,
     Route,
     SmartProxyGateway,
@@ -20,8 +20,7 @@ from smart_proxy_gateway import (
 )
 
 
-def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProxyConfig:
-    monkeypatch.setenv("SMART_PROXY_PASSWORD", "secret")
+def config(tmp_path: Path) -> ProxyConfig:
     path = tmp_path / "proxy.json"
     path.write_text(
         json.dumps(
@@ -34,7 +33,6 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProxyConfig:
                 "direct_cidrs": ["10.0.0.0/8"],
                 "host_overrides": {"inside.huawei.com": "7.1.2.3"},
                 "allowed_clients": ["127.0.0.1/32", "7.242.106.192/32"],
-                "auth": {"username": "ouroboros", "password_env": "SMART_PROXY_PASSWORD"},
                 "connect_timeout_seconds": 0.2,
             }
         ),
@@ -43,8 +41,8 @@ def config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ProxyConfig:
     return ProxyConfig.load(path)
 
 
-def test_configuration_and_route_rules(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    gateway = SmartProxyGateway(config(tmp_path, monkeypatch))
+def test_configuration_and_route_rules(tmp_path: Path) -> None:
+    gateway = SmartProxyGateway(config(tmp_path))
 
     assert gateway.configured_route("api.dragon.tools.huawei.com") is Route.DIRECT
     assert gateway.configured_route("dragon.tools.huawei.com") is Route.DIRECT
@@ -55,26 +53,13 @@ def test_configuration_and_route_rules(tmp_path: Path, monkeypatch: pytest.Monke
     assert gateway.client_allowed("7.242.106.193") is False
 
 
-def test_gateway_basic_auth_uses_constant_time_value_check() -> None:
-    auth = GatewayAuth("agent", "s3cret")
-    import base64
-
-    accepted = "Basic " + base64.b64encode(b"agent:s3cret").decode("ascii")
-    rejected = "Basic " + base64.b64encode(b"agent:wrong").decode("ascii")
-    assert auth.accepts(accepted) is True
-    assert auth.accepts(rejected) is False
-    assert auth.accepts(None) is False
-
-
 def test_parse_connect_request() -> None:
     request = parse_request_head(
         b"CONNECT rnd-idea-api.huawei.com:443 HTTP/1.1\r\n"
-        b"Host: rnd-idea-api.huawei.com:443\r\n"
-        b"Proxy-Authorization: Basic abc\r\n\r\n"
+        b"Host: rnd-idea-api.huawei.com:443\r\n\r\n"
     )
     assert request.method == "CONNECT"
     assert request.target == "rnd-idea-api.huawei.com:443"
-    assert request.header("proxy-authorization") == "Basic abc"
 
 
 def test_missing_client_allowlist_is_rejected(tmp_path: Path) -> None:
@@ -87,8 +72,24 @@ def test_missing_client_allowlist_is_rejected(tmp_path: Path) -> None:
         ProxyConfig.load(path)
 
 
+def test_removed_auth_configuration_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "proxy.json"
+    path.write_text(
+        json.dumps(
+            {
+                "upstream_proxy": "http://127.0.0.1:7890",
+                "allowed_clients": ["127.0.0.1/32"],
+                "auth": {"username": "legacy", "password": "secret"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="auth is no longer supported"):
+        ProxyConfig.load(path)
+
+
 def test_auto_route_falls_back_and_caches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    gateway = SmartProxyGateway(config(tmp_path, monkeypatch))
+    gateway = SmartProxyGateway(config(tmp_path))
     calls: list[str] = []
 
     async def direct(host: str, port: int):
@@ -121,7 +122,6 @@ def test_decision_cache_expires(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_connect_tunnel_reaches_direct_host(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
         async def echo(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -134,8 +134,7 @@ def test_connect_tunnel_reaches_direct_host(
         origin = await asyncio.start_server(echo, "127.0.0.1", 0)
         origin_port = origin.sockets[0].getsockname()[1]
         runtime = replace(
-            config(tmp_path, monkeypatch),
-            auth=None,
+            config(tmp_path),
             direct_domains=("inside.test",),
             host_overrides={"inside.test": "127.0.0.1"},
         )
@@ -161,5 +160,27 @@ def test_connect_tunnel_reaches_direct_host(
             origin.close()
             await proxy.wait_closed()
             await origin.wait_closed()
+
+    asyncio.run(scenario())
+
+
+def test_disallowed_client_is_rejected_before_proxying(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        runtime = replace(
+            config(tmp_path),
+            allowed_clients=(ipaddress.ip_network("192.0.2.1/32"),),
+        )
+        gateway = SmartProxyGateway(runtime)
+        proxy = await asyncio.start_server(gateway.handle_client, "127.0.0.1", 0)
+        proxy_port = proxy.sockets[0].getsockname()[1]
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+            response = await reader.read()
+            assert response.startswith(b"HTTP/1.1 403")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            proxy.close()
+            await proxy.wait_closed()
 
     asyncio.run(scenario())
