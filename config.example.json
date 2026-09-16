@@ -1,0 +1,32 @@
+{
+  "listen": "0.0.0.0:18081",
+  "upstream_proxy": "http://127.0.0.1:7890",
+  "default_route": "upstream",
+  "direct_domains": [
+    "rnd-idea-api.huawei.com",
+    "snapengine.cida.cce.prod-szv-g.dragon.tools.huawei.com",
+    "snapengine.cida.cce.prod-szv-y.dragon.tools.huawei.com",
+    "snapengine.codemate.cce.prod-kwe-g.dragon.tools.huawei.com",
+    "snapengine.codemate.cce.prod-kwe-y.dragon.tools.huawei.com"
+  ],
+  "proxy_domains": [],
+  "direct_cidrs": [],
+  "host_overrides": {
+    "rnd-idea-api.huawei.com": "7.222.196.152",
+    "snapengine.cida.cce.prod-szv-g.dragon.tools.huawei.com": "7.215.72.115",
+    "snapengine.cida.cce.prod-szv-y.dragon.tools.huawei.com": "7.215.72.115",
+    "snapengine.codemate.cce.prod-kwe-g.dragon.tools.huawei.com": "7.215.72.115",
+    "snapengine.codemate.cce.prod-kwe-y.dragon.tools.huawei.com": "7.215.72.115"
+  },
+  "allowed_clients": [
+    "127.0.0.1/32",
+    "7.242.106.192/32"
+  ],
+  "auth": {
+    "username": "ouroboros",
+    "password_env": "SMART_PROXY_PASSWORD"
+  },
+  "connect_timeout_seconds": 1.0,
+  "header_timeout_seconds": 10.0,
+  "decision_cache_seconds": 600
+}
