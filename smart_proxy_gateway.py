@@ -27,6 +27,19 @@ from urllib.parse import SplitResult, urlsplit
 LOGGER = logging.getLogger("smart-proxy")
 MAX_HEADER_BYTES = 64 * 1024
 BUFFER_SIZE = 64 * 1024
+CLOSE_TIMEOUT_SECONDS = 30.0
+
+
+async def _close_streams(*writers: asyncio.StreamWriter) -> None:
+    """Release sockets even when a peer stops reading or has reset the stream."""
+    async def close(writer: asyncio.StreamWriter) -> None:
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), CLOSE_TIMEOUT_SECONDS)
+        except (OSError, asyncio.TimeoutError):
+            writer.transport.abort()
+
+    await asyncio.gather(*(close(writer) for writer in writers))
 
 
 class ConfigError(ValueError):
@@ -295,10 +308,22 @@ class SmartProxyGateway:
         port: int,
     ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         connect_host = self.config.host_overrides.get(host, host)
-        return await asyncio.wait_for(
-            asyncio.open_connection(connect_host, port),
-            timeout=self.config.connect_timeout_seconds,
-        )
+        return await self._connect_tcp(connect_host, port, "direct TCP connect")
+
+    async def _connect_tcp(
+        self, host: str, port: int, stage: str,
+    ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        try:
+            return await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=self.config.connect_timeout_seconds,
+            )
+        except asyncio.TimeoutError as error:
+            raise TimeoutError(
+                f"{stage} to {host}:{port} timed out after {self.config.connect_timeout_seconds:g}s"
+            ) from error
+        except OSError as error:
+            raise OSError(f"{stage} to {host}:{port} failed: {error!r}") from error
 
     async def _open_upstream(
         self,
@@ -308,10 +333,7 @@ class SmartProxyGateway:
         proxy_host = self.config.upstream.hostname
         assert proxy_host is not None
         proxy_port = self.config.upstream.port or 80
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(proxy_host, proxy_port),
-            timeout=self.config.connect_timeout_seconds,
-        )
+        reader, writer = await self._connect_tcp(proxy_host, proxy_port, "upstream TCP connect")
         authority = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
         lines = [
             f"CONNECT {authority} HTTP/1.1",
@@ -324,21 +346,30 @@ class SmartProxyGateway:
                 f"{self.config.upstream.username}:{password}".encode("utf-8")
             ).decode("ascii")
             lines.append(f"Proxy-Authorization: Basic {token}")
-        writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
-        await writer.drain()
         try:
-            response = await asyncio.wait_for(
-                reader.readuntil(b"\r\n\r\n"),
-                timeout=self.config.header_timeout_seconds,
-            )
+            writer.write(("\r\n".join(lines) + "\r\n\r\n").encode("ascii"))
+            await writer.drain()
+            try:
+                response = await asyncio.wait_for(
+                    reader.readuntil(b"\r\n\r\n"),
+                    timeout=self.config.header_timeout_seconds,
+                )
+            except asyncio.TimeoutError as error:
+                raise TimeoutError(
+                    f"upstream CONNECT response from {proxy_host}:{proxy_port} "
+                    f"for {authority} timed out after {self.config.header_timeout_seconds:g}s"
+                ) from error
+            except (asyncio.IncompleteReadError, asyncio.LimitOverrunError) as error:
+                raise ProxyProtocolError(
+                    f"invalid upstream CONNECT response from {proxy_host}:{proxy_port} for {authority}: {error!r}"
+                ) from error
             first_line = response.split(b"\r\n", 1)[0].decode("ascii", "replace")
             parts = first_line.split(" ", 2)
             if len(parts) < 2 or not parts[1].isdigit() or not 200 <= int(parts[1]) < 300:
                 raise ProxyProtocolError(f"upstream CONNECT failed: {first_line}")
             return reader, writer
         except BaseException:
-            writer.close()
-            await writer.wait_closed()
+            await _close_streams(writer)
             raise
 
     async def handle_client(
@@ -351,6 +382,8 @@ class SmartProxyGateway:
         if not self.client_allowed(client_ip):
             await self._send_error(writer, 403, "client is not allowed")
             return
+        stage = "client request headers"
+        target = "unknown"
         try:
             raw = await asyncio.wait_for(
                 reader.readuntil(b"\r\n\r\n"),
@@ -359,6 +392,8 @@ class SmartProxyGateway:
             if len(raw) > MAX_HEADER_BYTES:
                 raise ProxyProtocolError("request headers are too large")
             request = parse_request_head(raw)
+            target = request.target
+            stage = "target connection"
             if request.method == "GET" and urlsplit(request.target).path == "/healthz":
                 await self._send_health(writer)
                 return
@@ -366,15 +401,19 @@ class SmartProxyGateway:
                 await self._handle_connect(request, reader, writer, client_ip)
             else:
                 await self._handle_http(request, reader, writer, client_ip)
-        except (asyncio.IncompleteReadError, ConnectionError):
-            writer.close()
-            await writer.wait_closed()
+        except asyncio.IncompleteReadError:
+            pass
         except (OSError, asyncio.TimeoutError, ProxyProtocolError) as error:
-            LOGGER.warning("client=%s request failed: %s", client_ip, error)
-            await self._send_error(writer, 502, str(error))
+            LOGGER.warning(
+                "client=%s stage=%s target=%s request failed: %r",
+                client_ip, stage, target, error,
+            )
+            await self._send_error(writer, 502, str(error) or type(error).__name__)
         except Exception:
             LOGGER.exception("client=%s unexpected proxy failure", client_ip)
             await self._send_error(writer, 500, "internal proxy error")
+        finally:
+            await _close_streams(writer)
 
     async def _handle_connect(
         self,
@@ -386,9 +425,16 @@ class SmartProxyGateway:
         host, port = _split_host_port(request.target, 443)
         upstream_reader, upstream_writer, route = await self.open_target(host, port)
         LOGGER.info("client=%s CONNECT %s:%d route=%s", client_ip, host, port, route.value)
-        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await client_writer.drain()
-        await self._relay(client_reader, client_writer, upstream_reader, upstream_writer)
+        try:
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await client_writer.drain()
+        except BaseException:
+            await _close_streams(upstream_writer)
+            raise
+        await self._relay(
+            client_reader, client_writer, upstream_reader, upstream_writer,
+            context=f"client={client_ip} target={host}:{port} route={route.value}",
+        )
 
     async def _handle_http(
         self,
@@ -416,10 +462,17 @@ class SmartProxyGateway:
         # open_target() gives us a tunnel all the way to the origin for both
         # routes (the upstream route has already completed CONNECT). The origin
         # therefore receives origin-form, never another proxy request.
-        head = self._rewrite_request_head(request, origin_target)
-        upstream_writer.write(head)
-        await upstream_writer.drain()
-        await self._relay(client_reader, client_writer, upstream_reader, upstream_writer)
+        try:
+            head = self._rewrite_request_head(request, origin_target)
+            upstream_writer.write(head)
+            await upstream_writer.drain()
+        except BaseException:
+            await _close_streams(upstream_writer)
+            raise
+        await self._relay(
+            client_reader, client_writer, upstream_reader, upstream_writer,
+            context=f"client={client_ip} target={host}:{port} route={route.value}",
+        )
 
     def _rewrite_request_head(self, request: ParsedRequest, target: str) -> bytes:
         lines = [f"{request.method} {target} {request.version}"]
@@ -435,48 +488,76 @@ class SmartProxyGateway:
         client_writer: asyncio.StreamWriter,
         upstream_reader: asyncio.StreamReader,
         upstream_writer: asyncio.StreamWriter,
+        *,
+        context: str = "",
     ) -> None:
-        async def pump(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
+        started = time.monotonic()
+        transferred = {"upload": 0, "download": 0}
+
+        async def pump(
+            source: asyncio.StreamReader, destination: asyncio.StreamWriter, direction: str,
+        ) -> None:
+            operation = "read"
             try:
-                while data := await source.read(BUFFER_SIZE):
+                while True:
+                    operation = "read"
+                    data = await source.read(BUFFER_SIZE)
+                    if not data:
+                        break
+                    operation = "write"
                     destination.write(data)
                     await destination.drain()
-            except (ConnectionError, asyncio.CancelledError):
-                pass
-            finally:
-                try:
+                    transferred[direction] += len(data)
+                # EOF only closes this direction. The peer may still be sending
+                # a large response (or finishing an upload in the reverse case).
+                if destination.can_write_eof():
+                    operation = "write_eof"
                     destination.write_eof()
-                except (AttributeError, OSError, RuntimeError):
-                    pass
+                    await destination.drain()
+                LOGGER.debug("%s relay EOF direction=%s bytes=%d", context, direction, transferred[direction])
+            except Exception as error:
+                LOGGER.warning(
+                    "%s relay failed direction=%s operation=%s upload_bytes=%d download_bytes=%d error=%r",
+                    context, direction, operation, transferred["upload"], transferred["download"], error,
+                )
+                raise
 
         tasks = [
-            asyncio.create_task(pump(client_reader, upstream_writer)),
-            asyncio.create_task(pump(upstream_reader, client_writer)),
+            asyncio.create_task(pump(client_reader, upstream_writer, "upload")),
+            asyncio.create_task(pump(upstream_reader, client_writer, "download")),
         ]
-        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        upstream_writer.close()
-        client_writer.close()
-        await asyncio.gather(
-            upstream_writer.wait_closed(),
-            client_writer.wait_closed(),
-            return_exceptions=True,
-        )
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            # The response/tunnel has already started. Close it on failure;
+            # never inject an HTTP error into the application byte stream.
+            pass
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await _close_streams(upstream_writer, client_writer)
+            LOGGER.info(
+                "%s relay closed upload_bytes=%d download_bytes=%d duration_seconds=%.3f",
+                context, transferred["upload"], transferred["download"], time.monotonic() - started,
+            )
 
     @staticmethod
     async def _send_error(writer: asyncio.StreamWriter, status: int, message: str) -> None:
         safe = message.replace("\r", " ").replace("\n", " ")[:512]
         body = (safe + "\n").encode("utf-8")
-        writer.write(
-            f"HTTP/1.1 {status} Proxy Error\r\nContent-Type: text/plain; charset=utf-8\r\n"
-            f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
-            + body
-        )
-        await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        try:
+            writer.write(
+                f"HTTP/1.1 {status} Proxy Error\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                + body
+            )
+            await writer.drain()
+        except OSError:
+            pass  # A disconnected client cannot receive an error response.
+        finally:
+            await _close_streams(writer)
 
     @staticmethod
     async def _send_health(writer: asyncio.StreamWriter) -> None:
@@ -506,6 +587,10 @@ async def run(config: ProxyConfig) -> None:
         config.upstream.hostname,
         config.upstream.port or 80,
         config.default_route.value,
+    )
+    LOGGER.info(
+        "connect_timeout_seconds=%g header_timeout_seconds=%g",
+        config.connect_timeout_seconds, config.header_timeout_seconds,
     )
 
     stop = asyncio.Event()

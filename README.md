@@ -57,6 +57,27 @@ DSH Pod 仍只连接自己的 `auth-proxy` sidecar；sidecar 再连接 PC 智能
 
 当 `direct_domains` 命中时，直连失败不会回退到外网代理，避免把内部域名泄露给外部代理。只有默认 `auto` 路由会尝试两条路径。
 
+## 大文件下载与故障排查
+
+转发按 64 KiB 分块并等待下游可写，不会把整个包读入内存。客户端结束发送（TCP 半关闭）后，网关仍会继续下载；两侧正常结束才关闭隧道。连接重置或任务取消时会清理两侧连接。
+
+- `connect_timeout_seconds`：到目标或上游代理的 TCP 建连超时。
+- `header_timeout_seconds`：等待客户端请求头或上游 CONNECT 响应头的超时。
+- 两项都不是文件下载总时长限制。把它们调到 100 秒不会修复已经建立的隧道被重置或上游传输中断。
+
+启动日志会输出实际加载的超时值。修改配置后需要重启网关。使用 `--log-level DEBUG` 可以查看每个传输方向的 EOF；正常结束会记录 `upload_bytes`、`download_bytes` 和 `duration_seconds`，异常会额外记录 `direction`、目标、路由和异常类型。这些字节数是网关已交给传输层的数据量，不是包大小校验结果。
+
+如果出现 `upstream TCP connect ... failed`，检查运行网关的 PC 上对应上游端口是否在监听；如果出现 `upstream CONNECT response ... timed out`，表示已连接上游，但未及时拿到隧道响应。`stage=client request headers` 则表示还没收到完整客户端请求头。`relay failed direction=download operation=read` 表示读取上游失败，`operation=write` 表示写入客户端失败，需结合异常与两端日志判断。
+
+网关不解密 HTTPS，无法在传输中断后自行重放包下载或切换出口；重试和完整性校验由 pnpm 等客户端处理。
+
+回归测试（包含直连/上游、HTTP/CONNECT、慢速接收、四路并发 4 MiB 下载的长度和 SHA-256 校验，以及半关闭、连接重置、取消与超时）：
+
+```powershell
+python -m pip install -e ".[test]"
+python -m pytest
+```
+
 ## 安全边界
 
 - 网关只做 TCP 隧道和普通 HTTP 转发，不执行 HTTPS MITM。
